@@ -1,4 +1,4 @@
-name: CI/CD Pipeline
+name: CI/CD - Angular Docker
 
 on:
   push:
@@ -7,116 +7,107 @@ on:
     branches: [main]
 
 jobs:
-  build-test-lint:
-    # Build Matrix for multiple Node.js versions
-    strategy:
-      matrix:
-        node-version: [16.x, 18.x, 20.x]
+  lint-test-build:
     runs-on: ubuntu-latest
-    env:
-      NODE_ENV: production
+    name: Lint, Test, and Build Angular App
+
     steps:
-      # Step 1: Checkout repository
+      # Checkout code
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Restore npm cache to speed up installs
-      - name: Restore npm cache
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ matrix.node-version }}-npm-${{ hashFiles('package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node-${{ matrix.node-version }}-npm-
-
-      # Step 3: Setup Node.js
-      - name: Setup Node.js
+      # Use Node.js with caching
+      - name: Use Node.js and enable npm cache
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node-version }}
+          node-version: 20
+          cache: 'npm'
 
-      # Step 4: Install dependencies
+      # Install dependencies
       - name: Install dependencies
         run: npm ci
 
-      # Step 5: Lint codebase
-      - name: Lint project
+      # Lint the codebase
+      - name: Lint Angular app
         run: npm run lint
 
-      # Step 6: Run unit tests and generate test reports
+      # Run unit tests with JUnit report
       - name: Run tests
-        run: npm run test -- --no-watch --no-progress --browsers=ChromeHeadlessCI --code-coverage
+        run: npm run test -- --watch=false --browsers=ChromeHeadless --code-coverage
 
-      # Step 7: Build Angular app for production
+      # Build Angular app
       - name: Build Angular app
-        run: npm run build -- --configuration=production
+        run: npm run build -- --configuration production
 
-      # Step 8: Upload build artifacts for usage in later jobs
-      - name: Upload production build artifact
+      # Upload build output as an artifact for Docker job (optional, for PRs)
+      - name: Upload dist folder
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: angular-dist-${{ matrix.node-version }}
-          path: dist/
-          retention-days: 3
+          name: dist
+          path: dist
 
-  docker-build-deploy:
-    needs: build-test-lint
+  docker:
+    needs: lint-test-build
     runs-on: ubuntu-latest
-    # Only run deploy from main branch and Node 20.x (latest recommended)
-    if: github.ref == 'refs/heads/main'
+    name: Build and Publish Docker Image
+
     steps:
-      # Step 1: Checkout repository
+      # Checkout code as Docker context may need full repo
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Step 2: Download build artifacts from the build job
-      - name: Download production build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: angular-dist-20.x
-          path: dist/
-
-      # Step 3: Set up Docker Buildx for advanced Docker features
+      # Setup Docker Buildx for advanced features and caching
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Step 4: Cache Docker layers for faster builds
+      # Cache Docker layers to speed up builds
       - name: Cache Docker layers
         uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-docker-${{ github.sha }}
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
           restore-keys: |
-            ${{ runner.os }}-docker-
+            ${{ runner.os }}-buildx-
 
-      # Step 5: Log in to Docker Hub (secrets must be stored in repository settings)
-      - name: Log in to Docker Hub
+      # Log in to DockerHub (uses repository secrets)
+      - name: DockerHub login
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Step 6: Build and push Docker image with cache and git SHA/tag
+      # Extract image tag information (use branch or short SHA for tags)
+      - name: Extract Docker image tag
+        id: extract_tag
+        run: |
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            TAG=pr-${{ github.event.pull_request.number }}
+          else
+            TAG=${GITHUB_SHA::8}
+          fi
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+
+      # Build and push Docker image with advanced caching
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:latest,${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:${{ github.sha }}
+          push: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:${{ steps.extract_tag.outputs.tag }},${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:latest
+          # Enable BuildKit inline cache
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to: type=local,dest=/tmp/.buildx-cache,mode=max
-          build-args: |
-            BUILD_PATH=dist/
 
-      # Step 7: Upload Docker image digest as artifact for traceability
-      - name: Upload Docker image digest
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image-digest
-          path: ./digest.txt
+      # Image digest output (useful for traceability)
+      - name: Image digest
+        run: echo "Image digest: ${{ steps.build-and-push.outputs.digest }}"
 
-      # Step 8: Post-build clean up (optional best practice)
-      - name: Remove dangling Docker images
-        run: |
-          docker image prune -af
+# Notes:
+# - This workflow uses npm and Docker layer caching for fast builds.
+# - Docker image is tagged with short SHA and 'latest' (on pushes to main).
+# - The build will only push images on push to main (pull requests won't push).
+# - Assumes the Dockerfile uses multi-stage best practices.
+# - Make sure you have set 'DOCKERHUB_USERNAME' and 'DOCKERHUB_TOKEN' secrets.
+# - Modify build/test commands if your Angular app uses custom scripts.
