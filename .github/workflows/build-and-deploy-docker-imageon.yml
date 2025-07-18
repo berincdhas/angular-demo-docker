@@ -9,75 +9,70 @@ on:
       - main
 
 env:
-  IMAGE_NAME: angulardemodocker
   REGISTRY: ghcr.io
-  DOCKERFILE_PATH: ./Dockerfile
-  BUILD_CONTEXT: .
-  DEPLOY_SERVER: ${{ secrets.DEPLOY_SERVER }}
-  DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
-  DEPLOY_KEY: ${{ secrets.DEPLOY_KEY }}
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GitHub Container Registry
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract version
-        id: vars
-        run: |
-          echo "VERSION=$(date +%Y%m%d%H%M%S)-${GITHUB_SHA::7}" >> $GITHUB_ENV
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
-          context: ${{ env.BUILD_CONTEXT }}
-          file: ${{ env.DOCKERFILE_PATH }}
+          context: .
           push: true
-          tags: |
-            ${{ env.REGISTRY }}/${{ github.repository }}:${{ env.VERSION }}
-            ${{ env.REGISTRY }}/${{ github.repository }}:latest
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
 
   deploy:
-    runs-on: ubuntu-latest
     needs: build
+    runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download SSH key
-        run: |
-          mkdir -p ~/.ssh
-          echo "${{ env.DEPLOY_KEY }}" > ~/.ssh/id_rsa
-          chmod 600 ~/.ssh/id_rsa
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
 
-      - name: Add SSH host key
-        run: |
-          ssh-keyscan -H ${{ env.DEPLOY_SERVER }} >> ~/.ssh/known_hosts
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Pull and run Docker image on remote server
+      - name: Pull and run Docker image (example deployment)
         run: |
-          IMAGE=${{ env.REGISTRY }}/${{ github.repository }}:latest
-          ssh -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no ${{ env.DEPLOY_USER }}@${{ env.DEPLOY_SERVER }} << EOF
-            docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password ${{ secrets.GITHUB_TOKEN }}
-            docker pull $IMAGE
-            docker stop angulardemodocker || true
-            docker rm angulardemodocker || true
-            docker run -d --name angulardemodocker -p 80:80 $IMAGE
-          EOF
-
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+          docker run -d -p 80:80 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+        # Replace with your actual deployment steps, such as SSH & Docker Compose for production servers
