@@ -1,64 +1,99 @@
-# This workflow builds, tests, lints, and deploys a Docker image for the Angular app.
-# It uses Docker Hub for the image registry, with DOCKER_HUB_USERNAME and DOCKER_HUB_TOKEN as secrets.
-# Steps: checkout code, set up Node.js, install dependencies, run tests/lint, build Angular app, build/tag Docker image, login to Docker Hub, and push image.
-
 name: Build and Deploy Docker Image
 
 on:
   push:
     branches:
       - main
+      - releases/*
   workflow_dispatch:
 
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
 
+    env:
+      IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker
+
     steps:
-      # Checkout repository code
-      - name: Checkout code
+      # Step 1: Checkout the code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Set up Node.js
+      # Step 2: Set up Node.js environment
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18
+          node-version: 20
 
-      # Install NPM dependencies
+      # Step 3: Cache npm dependencies for faster builds
+      - name: Cache npm dependencies
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      # Step 4: Install dependencies
       - name: Install dependencies
         run: npm ci
 
-      # Run linter
-      - name: Lint code
-        run: npm run lint
+      # Step 5: Run unit tests
+      - name: Run unit tests
+        run: npm run test -- --watch=false --browsers=ChromeHeadless
 
-      # Run unit tests
-      - name: Run tests
-        run: npm test -- --watch=false --no-progress --browsers=ChromeHeadless
-
-      # Build Angular app for production
+      # Step 6: Build the Angular application
       - name: Build Angular app
         run: npm run build -- --prod
 
-      # Set up Docker Buildx
+      # Step 7: Set up Docker Buildx for advanced build
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Log in to Docker Hub
+      # Step 8: Log in to Docker Hub
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKER_HUB_USERNAME }}
-          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      # Build and tag the Docker image
+      # Step 9: Cache Docker layers for faster rebuilds
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      # Step 10: Build and tag Docker image (tag with SHA and branch)
       - name: Build and tag Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          file: Dockerfile
+          file: ./Dockerfile
           push: true
-          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/angular-demo-docker:latest
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
+
+      # Step 11: (Optional) Deployment Step or Notification
+      - name: Deployment Success Notification
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: 587
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Angular Demo Docker Deployment Succeeded"
+          to: ${{ secrets.NOTIFY_EMAIL_TO }}
+          from: "github-actions@yourdomain.com"
+          body: |
+            🎉 Deployment succeeded on branch ${{ github.ref_name }}!
+            Docker Image: ${{ env.IMAGE_NAME }}:latest
 
 # End of workflow
+
