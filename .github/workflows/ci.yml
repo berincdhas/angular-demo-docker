@@ -2,138 +2,94 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-
-env:
-  IMAGE_NAME: angular-demo-docker
+    branches:
+      - main
 
 jobs:
-  build-and-test:
-    name: Build and Test (Node.js ${{ matrix.node }})
+  build-and-deploy:
     runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        node: [16, 18]
+
     steps:
+      # Checkout the source code
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Cache npm dependencies
+      # Cache node_modules for faster installs
+      - name: Cache Node.js modules
         uses: actions/cache@v4
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-${{ matrix.node }}-npm-cache-${{ hashFiles('**/package-lock.json') }}
+          path: |
+            **/node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
           restore-keys: |
-            ${{ runner.os }}-node-${{ matrix.node }}-npm-cache-
+            ${{ runner.os }}-node-
 
+      # Set up Node.js
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: ${{ matrix.node }}
-          cache: 'npm'
+          node-version: 18
 
+      # Install npm dependencies
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm test -- --watch=false --browsers=ChromeHeadlessNoSandbox
+      # Lint Angular project
+      - name: Lint Angular project
+        run: npm run lint
 
-      - name: Build Angular app
+      # Run tests with Angular
+      - name: Run Angular tests
+        run: npm test -- --watch=false --browsers=ChromeHeadless
+
+      # Build Angular app for production
+      - name: Build Angular project
         run: npm run build -- --configuration production
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: angular-dist-${{ matrix.node }}
-          path: dist/
-
-  docker-build:
-    name: Docker Build and Scan
-    needs: build-and-test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Restore Angular build artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: angular-dist-16
-          path: dist/
-
-      - name: Docker layer cache
+      # Cache docker layers for faster builds
+      - name: Cache Docker layers
         uses: actions/cache@v4
         with:
-          path: /tmp/.docker-layer-cache
-          key: docker-layer-cache-${{ github.sha }}
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
           restore-keys: |
-            docker-layer-cache-
+            ${{ runner.os }}-buildx-
 
+      # Set up Docker Buildx (enables advanced build features and caching)
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to registries
-        run: |
-          echo "${{ secrets.DOCKERHUB_PASSWORD }}" | docker login -u "${{ secrets.DOCKERHUB_USERNAME }}" --password-stdin
-          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+      # Log in to Docker Hub
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      # Build Docker image
       - name: Build Docker image
-        id: build-image
-        run: |
-          docker build \
-            --cache-from=type=local,src=/tmp/.docker-layer-cache \
-            --cache-to=type=local,dest=/tmp/.docker-layer-cache-new \
-            -t ${{ secrets.CONTAINER_REGISTRY || 'docker.io' }}/${{ secrets.REGISTRY_USER || secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-            -t ${{ secrets.CONTAINER_REGISTRY || 'ghcr.io' }}/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-            .
-        env:
-          DOCKER_BUILDKIT: 1
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
 
-      - name: Move new docker cache
-        run: |
-          rm -rf /tmp/.docker-layer-cache
-          mv /tmp/.docker-layer-cache-new /tmp/.docker-layer-cache
-
-      - name: Install Trivy
-        uses: aquasecurity/trivy-action@v0.18.0
-
+      # Scan Docker image for vulnerabilities using Aqua Trivy
       - name: Scan Docker image with Trivy
-        run: trivy image --exit-code 1 --severity CRITICAL,HIGH ${{ secrets.CONTAINER_REGISTRY || 'docker.io' }}/${{ secrets.REGISTRY_USER || secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+        uses: aquasecurity/trivy-action@v0.16.1
+        with:
+          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:latest
 
-      - name: Push Docker image to DockerHub
-        if: ${{ always() && secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_PASSWORD }}
-        run: |
-          docker push ${{ secrets.CONTAINER_REGISTRY || 'docker.io' }}/${{ secrets.REGISTRY_USER || secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-
-      - name: Push Docker image to GitHub Container Registry
-        if: ${{ always() && secrets.GITHUB_TOKEN }}
-        run: |
-          docker push ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-
-  notify:
-    name: Post Deployment Notification
-    needs: docker-build
-    runs-on: ubuntu-latest
-    steps:
-      - name: Notify via Slack (or Webhook)
-        if: success()
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_MESSAGE: |
-            CI/CD Pipeline succeeded for ${{ github.repository }}.
-            Docker image: ${{ env.IMAGE_NAME }}:${{ github.sha }} pushed to selected registries.
-      - name: Notify failure via Slack (or Webhook)
-        if: failure()
-        uses: rtCamp/action-slack-notify@v2
-        env:
-          SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_COLOR: '#FF0000'
-          SLACK_TITLE: 'CI/CD Pipeline Failure'
-          SLACK_MESSAGE: |
-            :x: CI/CD Pipeline failed for ${{ github.repository }} on commit ${{ github.sha }}.
-
-  # This workflow is easily extensible.
-  # Add more environments or target platforms as required in the matrix or as additional jobs.
+      # Push Docker image to Docker Hub
+      - name: Push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:latest
+          cache-from: type=local,src=/tmp/.buildx-cache
+          cache-to: type=local,dest=/tmp/.buildx-cache
