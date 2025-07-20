@@ -1,72 +1,64 @@
+# This workflow builds, tests, lints, and deploys a Docker image for the Angular app.
+# It uses Docker Hub for the image registry, with DOCKER_HUB_USERNAME and DOCKER_HUB_TOKEN as secrets.
+# Steps: checkout code, set up Node.js, install dependencies, run tests/lint, build Angular app, build/tag Docker image, login to Docker Hub, and push image.
+
 name: Build and Deploy Docker Image
 
 on:
   push:
     branches:
       - main
-  pull_request:
-    branches:
-      - main
-
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  workflow_dispatch:
 
 jobs:
-  build:
-    name: Build Docker Image
+  build-and-deploy:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout Repository
+      # Checkout repository code
+      - name: Checkout code
         uses: actions/checkout@v4
 
+      # Set up Node.js
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      # Install NPM dependencies
+      - name: Install dependencies
+        run: npm ci
+
+      # Run linter
+      - name: Lint code
+        run: npm run lint
+
+      # Run unit tests
+      - name: Run tests
+        run: npm test -- --watch=false --no-progress --browsers=ChromeHeadless
+
+      # Build Angular app for production
+      - name: Build Angular app
+        run: npm run build -- --prod
+
+      # Set up Docker Buildx
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GitHub Container Registry
+      # Log in to Docker Hub
+      - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ secrets.DOCKER_HUB_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
 
-      - name: Extract metadata for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-
-      - name: Build and Push Docker Image
+      # Build and tag the Docker image
+      - name: Build and tag Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
-          push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          file: Dockerfile
+          push: true
+          tags: ${{ secrets.DOCKER_HUB_USERNAME }}/angular-demo-docker:latest
 
-      - name: Image digest
-        run: echo "Digest is ${{ steps.meta.outputs.digest }}"
-
-  deploy:
-    name: Deploy Docker Image
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Set up SSH for deployment
-        uses: webfactory/ssh-agent@v0.8.0
-        with:
-          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
-
-      - name: Deploy to remote server
-        run: |
-          ssh -o StrictHostKeyChecking=no ${{ secrets.REMOTE_USER }}@${{ secrets.REMOTE_HOST }} << 'EOF'
-            docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
-            docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-            docker stop angular-demo || true
-            docker rm angular-demo || true
-            docker run -d --name angular-demo -p 80:80 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          EOF
+# End of workflow
