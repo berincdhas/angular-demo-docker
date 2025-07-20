@@ -1,0 +1,169 @@
+name: Build and Deploy Angular Docker App
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  checkout-and-setup:
+    name: Checkout and Node.js Setup
+    runs-on: ubuntu-latest
+    outputs:
+      cache-hit: ${{ steps.deps-cache.outputs.cache-hit }}
+    steps:
+      # Checkout code
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Setup Node.js
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Cache node_modules for faster builds
+      - name: Cache dependencies
+        id: deps-cache
+        uses: actions/cache@v4
+        with:
+          path: node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      # Install dependencies only if cache missed
+      - name: Install dependencies
+        if: steps.deps-cache.outputs.cache-hit != 'true'
+        run: npm ci
+
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    needs: checkout-and-setup
+    steps:
+      # Lint code to catch stylistic and programming errors
+      - name: Lint
+        run: npm run lint
+
+      # Run tests (including code coverage)
+      - name: Run tests
+        run: npm test -- --no-watch --no-progress --browsers=ChromeHeadless
+
+  build-angular:
+    name: Build Angular App
+    runs-on: ubuntu-latest
+    needs: [checkout-and-setup, lint-and-test]
+    steps:
+      # Build production Angular app
+      - name: Build production
+        run: npm run build -- --prod
+
+      # Upload built artifacts for next job
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  docker-build-push:
+    name: Build, Scan, and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build-angular
+    environment:
+      name: staging
+      url: https://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      # Download production build
+      - name: Download production build
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: ./dist
+
+      # DockerHub login (set secrets for DockerHub, else use GitHub Container Registry)
+      - name: Log in to Docker registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build Docker image (tag with SHA and latest)
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} .
+          docker tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      # Scan image for security vulnerabilities before pushing
+      - name: Scan Docker image with Trivy
+        uses: aquasecurity/trivy-action@v0.14.0
+        with:
+          image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      # Push Docker images if scan passes
+      - name: Push Docker images
+        run: |
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      # Upload image tag for deployment job
+      - name: Upload image tag
+        uses: actions/upload-artifact@v4
+        with:
+          name: image-tag
+          path: |
+            image-tag.txt
+        run: echo ${{ github.sha }} > image-tag.txt
+
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: docker-build-push
+    environment:
+      name: production
+      url: https://${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+      # Requires approval before deployment proceeds
+    steps:
+      # Download image tag artifact
+      - name: Download image tag
+        uses: actions/download-artifact@v4
+        with:
+          name: image-tag
+
+      # Deploy to production - customize this step to your actual deployment (Kubernetes, VM, etc.)
+      - name: Deploy Docker image to production
+        run: |
+          IMAGE_SHA=$(cat image-tag.txt)
+          echo "Deploying ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${IMAGE_SHA} to production environment"
+          # Add actual deployment commands here
+
+      # Notify deployment success
+      - name: Notify
+        run: echo "Deployment to production complete."
+
+  rollback:
+    name: Rollback Deployment
+    runs-on: ubuntu-latest
+    needs: [deploy-production]
+    if: failure()
+    # This job runs if previous deploy fails, and must be manually triggered/approved
+    steps:
+      - name: Rollback to previous stable version
+        run: |
+          echo "Rolling back deployment!"
+          # Insert your rollback command here (e.g. redeploy previous image tag)
+          # For example: docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:stable
+          # echo "Redeployed stable version"
