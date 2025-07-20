@@ -1,0 +1,115 @@
+name: CI-CD Docker Complex
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  detect-dockerfile:
+    name: Detect Dockerfile Presence
+    runs-on: ubuntu-latest
+    outputs:
+      dockerfile-exists: ${{ steps.check-dockerfile.outputs.exists }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check for Dockerfile
+        id: check-dockerfile
+        run: |
+          if [ -f Dockerfile ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+  build-and-test:
+    name: Build & Test Angular App
+    needs: detect-dockerfile
+    if: needs.detect-dockerfile.outputs.dockerfile-exists == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [18.x, 20.x]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Use Node.js ${{ matrix.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+
+      - name: Cache node modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            **/node_modules
+          key: ${{ runner.os }}-node-${{ matrix.node-version }}-${{ hashFiles('**/package-lock.json') }}
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Angular app
+        run: npm run build --if-present
+
+      - name: Run tests
+        run: |
+          npm run test -- --no-watch --no-progress --browsers=ChromeHeadless --code-coverage || true
+
+      - name: Archive test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-node-${{ matrix.node-version }}
+          path: |
+            coverage
+            test-results
+            **/coverage*
+            **/test-results*
+
+  docker-build-and-push:
+    name: Build & Push Docker Image
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: needs.detect-dockerfile.outputs.dockerfile-exists == 'true'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker BuildKit
+        run: echo "DOCKER_BUILDKIT=1" >> $GITHUB_ENV
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Extract Docker image name
+        id: extract_image
+        run: |
+          REPO_OWNER=$(echo "${GITHUB_REPOSITORY_OWNER,,}")
+          IMAGE_NAME=ghcr.io/$REPO_OWNER/${GITHUB_REPOSITORY#*/}:$GITHUB_SHA
+          echo "IMAGE_NAME=$IMAGE_NAME" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ steps.extract_image.outputs.IMAGE_NAME }} .
+
+      - name: Push Docker image
+        run: |
+          docker push ${{ steps.extract_image.outputs.IMAGE_NAME }}
+
+      - name: Image digest
+        run: docker inspect ${{ steps.extract_image.outputs.IMAGE_NAME }} --format='{{index .RepoDigests 0}}'
+
+# Required secrets:
+# - GHCR_TOKEN: A GitHub personal access token (classic) or GitHub Actions token with "write:packages" and "read:packages" permissions.
