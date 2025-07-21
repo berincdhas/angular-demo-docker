@@ -118,6 +118,8 @@ jobs:
         run: |
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           docker push ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+      - name: Add Image Tag
+        run: echo ${{ github.sha }} > image-tag.txt
 
       # Upload image tag for deployment job
       - name: Upload image tag
@@ -126,7 +128,7 @@ jobs:
           name: image-tag
           path: |
             image-tag.txt
-        run: echo ${{ github.sha }} > image-tag.txt
+
 
   deploy-production:
     name: Deploy to Production
