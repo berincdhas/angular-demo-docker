@@ -1,5 +1,0 @@
-on:
-  workflow_dispatch:
-  # (Retain other existing triggers here, such as push, pull_request, etc.)
-
-# ...rest of your workflow configuration...
