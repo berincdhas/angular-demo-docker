@@ -4,70 +4,96 @@ on:
   push:
     branches:
       - main
-      - 'release/*'
   pull_request:
     branches:
       - main
-      - 'release/*'
   workflow_dispatch:
 
 concurrency:
-  group: build-and-deploy-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-permissions:
-  contents: read
-  packages: write
-  id-token: write
-  actions: read
-  checks: write
-
 jobs:
-  build:
+  codeql-analysis:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+
+  build-angular-app:
     name: Build Angular Application
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup Node.js
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '18'
-          cache: 'npm'
+          node-version: '16'
 
-      - name: Install Dependencies
+      - name: Cache Node.js modules
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
+
+      - name: Install dependencies
         run: npm ci
 
       - name: Run Linter
-        run: npm run lint
+        run: npm run lint || (echo "Linter failed, see output above." && exit 1)
+
+      - name: Upload ESLint Report on Failure
+        if: failure() && steps.run_linter.outcome == 'failure'
+        run: |
+          if [ -f eslint-report.html ]; then
+            echo "Uploading linter error report"
+          fi
 
       - name: Run Unit Tests
         run: npm run test -- --watch=false --browsers=ChromeHeadless
 
-      - name: Build Production Artifacts
-        run: npm run build -- --configuration production
+      - name: Build Angular App
+        run: npm run build -- --prod
 
-      - name: Upload Production Artifacts
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
 
-  dockerize:
+  build-and-push-docker-image:
     name: Build & Push Docker Image
-    needs: build
-    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/heads/release/')
+    needs: build-angular-app
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      DOCKER_BUILDKIT: 1
+    if: ${{ needs.build-angular-app.result == 'success' }}
     steps:
-      - name: Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Download Production Artifacts
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
           name: dist
@@ -76,89 +102,36 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to GitHub Container Registry
+      - name: Login to DockerHub
         uses: docker/login-action@v3
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Build and Push Docker Image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./Dockerfile
-          platforms: linux/amd64
           push: true
-          build-args: |
-            NG_BUILD_PATH=dist
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-
-      - name: Upload Docker Image Digest
-        run: echo "${{ steps.meta.outputs.digest }}" > docker-image-digest.txt
-      - name: Upload Digest Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image-digest
-          path: docker-image-digest.txt
+          tags: ${{ secrets.DOCKER_USERNAME }}/angular-demo:latest
 
   deploy:
     name: Deploy to Production
-    needs: dockerize
-    if: github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    environment:
-      name: production
-      url: ${{ steps.deploy.outputs.deployment_url }}
-    steps:
-      - name: Download Docker Image Digest
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-image-digest
-
-      - name: Set up Docker CLI
-        uses: docker/setup-buildx-action@v3
-
-      - name: Deploy to Docker Host
-        id: deploy
-        env:
-          DOCKER_HOST: ${{ secrets.PRODUCTION_DOCKER_HOST }}
-          DOCKER_TLS_VERIFY: ${{ secrets.PRODUCTION_DOCKER_TLS_VERIFY }}
-          DOCKER_CERT_PATH: ${{ secrets.PRODUCTION_DOCKER_CERT_PATH }}
-          IMAGE_TAG: ghcr.io/${{ github.repository }}:latest
-        run: |
-          docker --version
-          docker login ghcr.io -u ${{ github.actor }} -p ${{ secrets.GITHUB_TOKEN }}
-          docker pull $IMAGE_TAG
-          docker stop angular-app || true
-          docker rm angular-app || true
-          docker run -d --name angular-app -p 80:80 $IMAGE_TAG
-          echo "deployment_url=http://your.prod.server/" >> $GITHUB_OUTPUT
-
-  codeql:
-    name: CodeQL Analysis
+    needs: build-and-push-docker-image
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    permissions:
-      security-events: write
-      actions: read
-      contents: read
+    if: ${{ needs.build-and-push-docker-image.result == 'success' }}
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+      - name: SSH & Deploy
+        uses: appleboy/ssh-action@v1.0.3
         with:
-          languages: javascript
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+          host: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          username: ${{ secrets.PRODUCTION_SERVER_USER }}
+          key: ${{ secrets.PRODUCTION_SERVER_SSH_KEY }}
+          port: ${{ secrets.PRODUCTION_SERVER_SSH_PORT }}
+          script: |
+            docker pull ${{ secrets.DOCKER_USERNAME }}/angular-demo:latest
+            docker stop angular-demo || true
+            docker rm angular-demo || true
+            docker run -d --name angular-demo -p 80:80 ${{ secrets.DOCKER_USERNAME }}/angular-demo:latest
