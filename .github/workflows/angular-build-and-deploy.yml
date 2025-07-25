@@ -93,7 +93,6 @@ jobs:
     timeout-minutes: 15
     environment:
       name: production
-      url: ${{ steps.deploy-to-production.outputs.deployment_url }}
     steps:
       - name: Deploy to Production Server
         id: deploy-to-production
