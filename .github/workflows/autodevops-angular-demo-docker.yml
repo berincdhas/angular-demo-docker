@@ -2,114 +2,114 @@ name: autodevops angular demo docker build deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
   group: autodevops-angular-demo-docker-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
-  codeql:
-    name: Code Scanning - CodeQL
+  test:
+    name: Run Unit Tests
     runs-on: ubuntu-latest
-    permissions:
-      actions: read
-      contents: read
-      security-events: write
-    strategy:
-      fail-fast: false
-      matrix:
-        language: [ 'javascript' ]
-    timeout-minutes: 20
+    timeout-minutes: 10
+
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
+
+      - name: Use Node.js 16.x
+        uses: actions/setup-node@v3
+        with:
+          node-version: '16.x'
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Run Unit Tests
+        run: npm run test -- --watch=false --browsers=ChromeHeadless --no-progress --code-coverage
+
+    continue-on-error: false
+
+  codeql:
+    name: Code Scanning - CodeQL (javascript)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ needs.test.result == 'success' }}
+
+    steps:
+      - uses: actions/checkout@v3
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v2
         with:
-          languages: ${{ matrix.language }}
-
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v2
+          languages: javascript
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v2
 
-  test:
-    name: Run Unit Tests
+  build:
+    name: Build Angular App and Docker Image
+    needs: [test, codeql]
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+    if: ${{ needs.test.result == 'success' && needs.codeql.result == 'success' }}
 
-      - name: Use Node.js
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Use Node.js 16.x
         uses: actions/setup-node@v3
         with:
-          node-version: 18
+          node-version: '16.x'
 
       - name: Install dependencies
-        run: npm ci
-
-      - name: Run unit tests
-        run: npm run test -- --no-watch --no-progress --browsers=ChromeHeadless
-
-  build-and-dockerize:
-    name: Build Angular App and Docker Image
-    runs-on: ubuntu-latest
-    needs: test
-    timeout-minutes: 20
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
-
-      - name: Use Node.js
-        uses: actions/setup-node@v3
-        with:
-          node-version: 18
-
-      - name: Install dependencies
-        run: npm ci
+        run: npm install
 
       - name: Build Angular app
         run: npm run build -- --configuration=production
 
-      - name: Log in to DockerHub
-        uses: docker/login-action@v2
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Login to Docker Registry
+        env:
+          DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+          DOCKER_REGISTRY_USERNAME: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
+          DOCKER_REGISTRY_PASSWORD: ${{ secrets.DOCKER_REGISTRY_PASSWORD }}
+        run: echo "${DOCKER_REGISTRY_PASSWORD}" | docker login "${DOCKER_REGISTRY}" -u "${DOCKER_REGISTRY_USERNAME}" --password-stdin
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+      - name: Build Docker image
+        env:
+          DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+        run: docker build -t "${DOCKER_REGISTRY}/angular-demo-docker:${{ github.sha }}" .
 
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v4
-        with:
-          context: .
-          push: true
-          tags: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo:latest
+      - name: Push to Docker Registry
+        env:
+          DOCKER_REGISTRY: ${{ secrets.DOCKER_REGISTRY }}
+        run: docker push "${DOCKER_REGISTRY}/angular-demo-docker:${{ github.sha }}"
 
   deploy:
     name: Deploy to Docker Host
+    needs: build
     runs-on: ubuntu-latest
-    needs: build-and-dockerize
     timeout-minutes: 15
+    if: ${{ needs.build.result == 'success' }}
+
     steps:
-      - name: Deploy to self-hosted Docker server
-        uses: appleboy/ssh-action@v0.1.10
+      - name: SSH and Deploy on Docker Host
+        uses: appleboy/ssh-action@v0.1.7
         with:
           host: ${{ secrets.DOCKER_HOST }}
-          username: ${{ secrets.DOCKER_USER }}
-          key: ${{ secrets.DOCKER_SSH_KEY }}
+          username: ${{ secrets.DOCKER_HOST_USER }}
+          key: ${{ secrets.DOCKER_HOST_SSH_KEY }}
           script: |
-            docker pull ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo:latest
-            docker stop angular-demo || true
-            docker rm angular-demo || true
-            docker run -d --name angular-demo -p 80:80 ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo:latest
+            docker login ${{ secrets.DOCKER_REGISTRY }} -u ${{ secrets.DOCKER_REGISTRY_USERNAME }} -p ${{ secrets.DOCKER_REGISTRY_PASSWORD }}
+            docker pull ${{ secrets.DOCKER_REGISTRY }}/angular-demo-docker:${{ github.sha }}
+            docker stop angular-demo-docker || true
+            docker rm angular-demo-docker || true
+            docker run -d --name angular-demo-docker -p 80:80 ${{ secrets.DOCKER_REGISTRY }}/angular-demo-docker:${{ github.sha }}
