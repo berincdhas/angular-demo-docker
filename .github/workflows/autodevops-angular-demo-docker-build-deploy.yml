@@ -8,102 +8,119 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      environment:
+        description: "Environment to deploy to"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - "dev"
+          - "stage"
+          - "prod"
+      image_tag:
+        description: "Docker image tag"
+        required: false
+        default: ""
+      manual_build:
+        description: "Manually trigger Docker build"
+        required: false
+        default: "false"
+        type: boolean
+
+env:
+  REGISTRY_URL: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 concurrency:
-  group: autodevops-angular-demo-docker-build-deploy-${{ github.ref }}
+  group: autodevops-angular-demo-docker-build-deploy-${{ github.ref }}-${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
   packages: write
-  id-token: write
 
 jobs:
-  build-angular:
-    name: Build Angular Application
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Use Node.js 20.x
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20.x'
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Lint application
-        run: npm run lint
-
-      - name: Run tests
-        run: npm test -- --watch=false --browsers=ChromeHeadless --no-progress --code-coverage
-
-      - name: Build production
-        run: npm run build -- --configuration=production
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: angular-dist
-          path: dist/
-          retention-days: 2
-
-  dockerize:
+  build-and-push:
+    if: (github.event_name != 'workflow_dispatch') || (github.event_name == 'workflow_dispatch' && github.event.inputs.manual_build == 'true')
     name: Build and Push Docker Image
-    needs: build-angular
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Download build artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: angular-dist
-          path: dist
+        uses: actions/checkout@v3
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v2
 
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
         with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY_URL }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Set Docker image name
-        id: docker_image
+      - name: Extract Docker image tag
+        id: extract_tag
         run: |
-          IMAGE="ghcr.io/${{ github.repository }}/angular-demo:$(echo $GITHUB_SHA | head -c7)"
-          echo "image=$IMAGE" >> $GITHUB_OUTPUT
+          if [ "${{ github.event.inputs.image_tag || '' }}" != "" ]; then
+            echo "tag=${{ github.event.inputs.image_tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "tag=${GITHUB_SHA::7}" >> $GITHUB_OUTPUT
+          fi
 
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v4
         with:
           context: .
-          file: Dockerfile
           push: true
-          tags: |
-            ${{ steps.docker_image.outputs.image }}
-            ghcr.io/${{ github.repository }}/angular-demo:latest
-
-      - name: Image digest
-        run: echo "IMAGE: ${{ steps.docker_image.outputs.image }}"
+          tags: ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${{ steps.extract_tag.outputs.tag }}
 
   deploy:
-    name: Deploy Angular Docker Image
-    needs: dockerize
+    name: Deploy to ${{ github.event.inputs.environment || 'dev' }}
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    timeout-minutes: 15
+    needs: build-and-push
+    timeout-minutes: 20
+    if: |
+      (github.event_name != 'workflow_dispatch') ||
+      (github.event_name == 'workflow_dispatch' && contains(fromJson('["dev","stage","prod"]'), github.event.inputs.environment))
     steps:
-      - name: Deploy to Production - Placeholder
+      - name: Set Environment Variables
         run: |
-          echo "Deploy image step. Replace with your deployment steps (e.g., kubectl, Helm, SSH)."
-          echo "IMAGE: ghcr.io/${{ github.repository }}/angular-demo:latest"
+          echo "DEPLOY_ENVIRONMENT=${{ github.event.inputs.environment || 'dev' }}" >> $GITHUB_ENV
+          if [ "${{ github.event.inputs.image_tag || '' }}" != "" ]; then
+            echo "IMAGE_TAG=${{ github.event.inputs.image_tag }}" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+          fi
+
+      - name: Checkout Deployment Repo
+        uses: actions/checkout@v3
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.ref }}
+
+      - name: Dummy Deploy Step
+        run: |
+          echo "Deploying ${{ env.REGISTRY_URL }}/${{ env.IMAGE_NAME }}:${IMAGE_TAG} to ${DEPLOY_ENVIRONMENT}"
+
+  code-scanning:
+    name: CodeQL Analyze
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      security-events: write
+      actions: read
+      contents: read
+    if: github.event_name != 'workflow_dispatch'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: javascript
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
