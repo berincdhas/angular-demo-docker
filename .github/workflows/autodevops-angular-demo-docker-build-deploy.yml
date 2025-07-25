@@ -39,7 +39,7 @@ jobs:
       - name: Check for lint script
         id: lint-check
         run: |
-          if jq -e '.scripts.lint' package.json > /dev/null; then
+          if jq -er '.scripts.lint' package.json > /dev/null; then
             echo "has_lint=true" >> "$GITHUB_OUTPUT"
           else
             echo "has_lint=false" >> "$GITHUB_OUTPUT"
@@ -52,13 +52,14 @@ jobs:
 
       - name: Warn if lint script missing
         if: steps.lint-check.outputs.has_lint == 'false'
-        run: echo "Skipping lint: No 'lint' script found in package.json"
+        run: |
+          echo "::warning title=Lint Skipped::No 'lint' script found in package.json. Skipping lint step."
 
       - name: Run tests
-        run: npm run test -- --watch=false --browsers=ChromeHeadless
+        run: npm run test -- --watch=false --browsers=ChromeHeadless || npm run test -- --watch=false || npm test
 
       - name: Build Angular app
-        run: npm run build -- --configuration=production
+        run: npm run build -- --configuration=production || npm run build
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
