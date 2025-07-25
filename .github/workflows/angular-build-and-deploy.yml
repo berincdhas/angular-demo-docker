@@ -91,8 +91,12 @@ jobs:
     needs: dockerize
     if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
     timeout-minutes: 15
+    environment:
+      name: production
+      url: ${{ steps.deploy-to-production.outputs.deployment_url }}
     steps:
       - name: Deploy to Production Server
+        id: deploy-to-production
         uses: appleboy/ssh-action@v1.0.3
         with:
           host: ${{ secrets.DEPLOY_HOST }}
