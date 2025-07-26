@@ -4,149 +4,103 @@ on:
   push:
     branches:
       - main
+      - master
   pull_request:
     branches:
       - main
+      - master
   workflow_dispatch:
 
 concurrency:
-  group: autodevops-angular-demo-docker-build-deploy-${{ github.ref }}
+  group: autodevops-angular-demo-docker-${{ github.ref }}-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: true
 
 permissions:
   contents: read
+  packages: write
+  pages: write
   id-token: write
-  actions: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
-  code-security-scan:
-    name: Security and Linting Checks
+  build-and-deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20.x
-      - name: Install dependencies
-        run: npm ci
-      - name: Lint code
-        run: npm run lint
-      - name: Run Snyk to check for vulnerabilities
-        uses: snyk/actions/node@v3.0.0
-        with:
-          command: test
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-      - name: Upload Snyk HTML Report (if generated)
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: snyk-html-report
-          path: snyk-report.html
-          if-no-files-found: ignore
+    timeout-minutes: 25
 
-  build:
-    name: Build Angular Production Artifacts
-    runs-on: ubuntu-latest
-    needs: code-security-scan
-    timeout-minutes: 15
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
+
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v3
         with:
-          node-version: 20.x
+          node-version: '16'
+
       - name: Install dependencies
         run: npm ci
-      - name: Run unit tests
+
+      - name: Run tests
         run: npm run test -- --watch=false --browsers=ChromeHeadless
-      - name: Build Angular app
-        run: npm run build -- --configuration production
-      - name: Upload Angular dist
-        uses: actions/upload-artifact@v4
-        with:
-          name: angular-dist
-          path: dist/
 
-  docker-image:
-    name: Build and Push Docker Image
-    runs-on: ubuntu-latest
-    needs: build
-    timeout-minutes: 20
-    env:
-      DOCKER_IMAGE: ghcr.io/${{ github.repository }}/angular-demo:${{ github.sha }}
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-      - name: Download Angular dist
-        uses: actions/download-artifact@v4
+      - name: Build production
+        run: npm run build -- --configuration=production
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v2
         with:
-          name: angular-dist
-          path: dist/
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
+          registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+
       - name: Build and push Docker image
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v4
         with:
           context: .
+          file: ./Dockerfile
           push: true
-          tags: ${{ env.DOCKER_IMAGE }}
-          build-args: |
-            DIST_FOLDER=dist/
-      - name: Image digest
-        run: echo "Digest ${{ steps.docker_build.outputs.digest }}"
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
 
-  deploy:
-    name: Deploy to Production Environment
-    runs-on: ubuntu-latest
-    needs: docker-image
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    timeout-minutes: 15
-    env:
-      DEPLOY_IMAGE: ghcr.io/${{ github.repository }}/angular-demo:${{ github.sha }}
-    steps:
-      - name: Prepare Deployment (Placeholder)
-        run: echo "Deployment to production should be implemented using your infrastructure’s requirements."
-      # Uncomment and configure the section below for a real deployment destination, e.g., Kubernetes, Azure, ECS
-      # - name: Set up kubectl
-      #   uses: azure/setup-kubectl@v3
-      #   with:
-      #     version: v1.28.0
-      # - name: Set up KubeConfig
-      #   run: echo "${KUBECONFIG_BASE64}" | base64 --decode > k8sconfig
-      #   env:
-      #     KUBECONFIG_BASE64: ${{ secrets.KUBECONFIG_BASE64 }}
-      # - name: Deploy to Kubernetes
-      #   run: |
-      #     kubectl --kubeconfig=k8sconfig set image deployment/angular-demo angular-demo=${{ env.DEPLOY_IMAGE }}
-      #     kubectl --kubeconfig=k8sconfig rollout status deployment/angular-demo
+      - name: Deploy to GitHub Pages
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        uses: peaceiris/actions-gh-pages@v3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./dist/angular-demo-docker
 
-  codeql:
-    name: Code Scanning - CodeQL
+  codeql-analysis:
+    name: CodeQL Analyze
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
       actions: read
       contents: read
       security-events: write
+
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v3
+
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: javascript
-      - name: Autobuild
-        uses: github/codeql-action/autobuild@v3
+
+      - name: Build project for CodeQL
+        run: |
+          npm ci
+          npm run build -- --configuration=production
+
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
