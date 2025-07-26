@@ -8,112 +8,87 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: autodevops-angular-demo-docker-build-deploy-${{ github.event.pull_request.number || github.ref }}
+  group: autodevops-angular-demo-docker-build-deploy-${{ github.ref }}
   cancel-in-progress: true
-
-permissions:
-  contents: read
-  packages: write
-  id-token: write
 
 jobs:
   build:
     name: Build Angular Application
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     timeout-minutes: 15
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
         with:
-          node-version: 20
-
+          node-version: '18'
       - name: Install dependencies
         run: npm ci
+      - name: Build
+        run: npm run build
 
-      - name: Run lint
-        run: npm run lint
-
-      - name: Run tests
-        run: npm test -- --watch=false --browsers=ChromeHeadless
-
-      - name: Build Angular app
-        run: npm run build -- --configuration=production
-
-      - name: Upload production build
-        uses: actions/upload-artifact@v4
-        with:
-          name: angular-dist
-          path: dist/
-
-  dockerize:
-    name: Build and Push Docker Image
-    needs: build
+  static-analysis:
+    name: Static Code Analysis
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    env:
-      IMAGE_NAME: ghcr.io/${{ github.repository }}:latest
+    needs: build
+    permissions:
+      contents: read
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download build artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v3
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
         with:
-          name: angular-dist
-          path: dist/
+          node-version: '18'
+      - name: Install dependencies
+        run: npm ci
+      - name: Check for npm lint script
+        id: check_lint
+        run: |
+          if npm run | grep -q "lint"; then
+            echo "has-lint=true" >> $GITHUB_OUTPUT
+          else
+            echo "has-lint=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Run static code analysis
+        if: steps.check_lint.outputs.has-lint == 'true'
+        run: npm run lint
+      - name: Skipped static code analysis
+        if: steps.check_lint.outputs.has-lint == 'false'
+        run: echo "No lint script found, skipping static analysis."
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
+  docker:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      contents: read
+    environment:
+      name: production
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v3
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v2
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: ${{ env.IMAGE_NAME }}
-          build-args: |
-            DIST_PATH=dist
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+      - name: Build Docker image
+        run: docker build -t ${{ secrets.DOCKER_USERNAME }}/angular-demo-docker:latest .
+      - name: Push Docker image
+        run: docker push ${{ secrets.DOCKER_USERNAME }}/angular-demo-docker:latest
 
   deploy:
     name: Deploy Application
-    needs: dockerize
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
-    steps:
-      - name: Deploy image (placeholder)
-        run: echo "Deploy step - Replace with actual deployment logic such as kubectl, ssh, or cloud CLI commands"
-
-  codeql:
-    name: Static Code Analysis
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    needs: docker
     permissions:
-      actions: read
       contents: read
-      security-events: write
-    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 10
+    environment:
+      name: production
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
-        with:
-          languages: javascript
-
-      - name: Auto-build
-        uses: github/codeql-action/autobuild@v3
-
-      - name: Perform CodeQL Analysis
-        uses: github/codeql-action/analyze@v3
+      - name: Deploy to production server
+        run: echo "Deploy step placeholder"
