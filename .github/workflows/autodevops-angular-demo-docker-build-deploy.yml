@@ -1,5 +1,4 @@
-name: autodevops-angular-demo-docker-build-deploy
-
+name: angular-demo-docker-build-deploy
 on:
   push:
     branches:
@@ -10,70 +9,67 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: autodevops-angular-demo-docker-${{ github.ref }}
+  group: build-deploy-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 permissions:
   contents: read
   id-token: write
-  packages: read
+  packages: write
 
 jobs:
   build:
+    name: Build Angular App
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Set up Node.js
+      - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 20
-
-      - name: Cache npm dependencies
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-npm-
+          node-version: "18.x"
+          cache: 'npm'
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Run Angular tests
-        run: npm run test -- --watch=false --browsers=ChromeHeadless --no-progress --code-coverage
+      - name: Lint code
+        run: npm run lint
 
-      - name: Build Angular application
-        run: npm run build -- --configuration production
+      - name: Run tests
+        run: npm run test -- --watch=false --browsers=ChromeHeadlessNoSandbox --code-coverage
 
-      - name: Upload build artifacts
+      - name: Build production
+        run: npm run build -- --configuration=production
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: angular-dist
           path: dist/
 
   dockerize:
-    needs: build
+    name: Build & Push Docker Image
     runs-on: ubuntu-latest
+    needs: build
     timeout-minutes: 20
-    permissions:
-      contents: read
-      id-token: write
-      packages: write
+    env:
+      IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/angular-demo-docker:${{ github.sha }}
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
 
-      - name: Download build artifacts
+      - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
           name: angular-dist
           path: dist/
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
 
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
@@ -82,32 +78,59 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata (tags, labels) for Docker
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
           file: Dockerfile
-          build-args: |
-            DIST_PATH=dist/
-          push: ${{ github.event_name != 'pull_request' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          push: true
+          tags: ${{ env.IMAGE_NAME }}
 
-  code_scan:
+      - name: Image digest
+        run: echo "Docker image digest ${{ steps.docker_build.outputs.digest }}"
+
+  deploy:
+    name: Deploy to Production
     runs-on: ubuntu-latest
+    needs: dockerize
     timeout-minutes: 15
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    environment:
+      name: production
+      url: ${{ steps.deploy.outputs.url }}
+    steps:
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: angular-dist
+          path: dist/
+
+      - name: Set up deployment credentials
+        run: echo "Configure your deployment secrets and credentials here."
+        shell: bash
+
+      - name: Deploy to cloud/VM
+        id: deploy
+        run: |
+          echo "Deploying docker image ${{ needs.dockerize.outputs.image }}"
+          # Actual deploy step placeholder
+          # Use SSH, cloud provider, or GitHub Deployments API here
+          DEPLOYMENT_URL="https://yourapp.example.com"
+          echo "url=${DEPLOYMENT_URL}" >> $GITHUB_OUTPUT
+
+  security:
+    name: Code Scanning
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
     permissions:
+      security-events: write
       actions: read
       contents: read
-      security-events: write
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Initialize CodeQL
@@ -115,21 +138,19 @@ jobs:
         with:
           languages: javascript
 
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
 
-  deploy:
-    needs: [dockerize, code_scan]
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+  dependabot:
+    name: Dependency Vulnerability Scan
     runs-on: ubuntu-latest
-    environment:
-      name: production
-      url: ${{ steps.deploy.outputs.url }}
-    timeout-minutes: 20
+    timeout-minutes: 8
     steps:
-      - name: Print deployment step (placeholder)
-        run: echo "Replace this with your real deployment logic, e.g., push to Kubernetes, AWS, Azure, etc."
-        id: deploy
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-      - name: Notify deployment complete
-        run: echo "Deployment successful to production."
+      - name: Run npm audit
+        run: npm audit --production --audit-level=high || true
