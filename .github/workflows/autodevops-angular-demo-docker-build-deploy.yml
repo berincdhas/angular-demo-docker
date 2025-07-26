@@ -15,14 +15,13 @@ concurrency:
 
 permissions:
   contents: read
-  packages: write
   id-token: write
 
 jobs:
-  build-angular-app:
+  build:
     name: Build Angular Application
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -30,88 +29,107 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: 20
+
+      - name: Cache Node.js modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            node_modules
+          key: ${{ runner.os }}-node-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-
 
       - name: Install dependencies
         run: npm ci
 
-      - name: Build Angular app
-        run: npm run build --prod
+      - name: Run lint
+        run: npm run lint
 
-      - name: Upload production-ready build
+      - name: Run unit tests
+        run: npm run test -- --watch=false --browsers=ChromeHeadless
+
+      - name: Build Angular app
+        run: npm run build -- --configuration=production
+
+      - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: dist
+          name: dist-app
           path: dist/
 
-  build-and-push-docker-image:
+  dockerize:
     name: Build and Push Docker Image
     runs-on: ubuntu-latest
-    needs: build-angular-app
+    needs: build
     timeout-minutes: 20
-    environment: production
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Download production-ready build
+      - name: Download build artifact
         uses: actions/download-artifact@v4
         with:
-          name: dist
+          name: dist-app
           path: dist
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Docker Hub
-        if: ${{ secrets.DOCKERHUB_USERNAME && secrets.DOCKERHUB_TOKEN }}
+      - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Fail if Docker credentials not set
-        if: ${{ !secrets.DOCKERHUB_USERNAME || !secrets.DOCKERHUB_TOKEN }}
-        run: |
-          echo "Docker Hub credentials are not set. Please add DOCKERHUB_USERNAME and DOCKERHUB_TOKEN as repository secrets."
-          exit 1
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=sha,event=push
+            type=ref,event=branch
+            type=ref,event=pr
 
-      - name: Build Docker image
-        run: |
-          docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:latest .
-
-      - name: Push Docker image
-        run: |
-          docker push ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:latest
-
-      - name: Logout from Docker Hub
-        if: always()
-        run: docker logout
-
-      - name: Clean up docker
-        if: always()
-        run: |
-          docker system prune -af || true
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          build-args: |
+            BUILD_DIR=dist
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
 
   deploy:
-    name: Deploy Application
+    name: Deploy to Production
     runs-on: ubuntu-latest
-    needs: build-and-push-docker-image
-    timeout-minutes: 10
-    if: ${{ needs.build-and-push-docker-image.result == 'success' }}
+    needs: dockerize
+    timeout-minutes: 15
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
     steps:
-      - name: Deploy using kubectl (placeholder)
-        run: echo "Deploy step would go here"
+      - name: Deploy to Production (placeholder)
+        run: echo "Implement your deployment step here, e.g., kubectl apply, helm upgrade, ssh to server, or use another GitHub Action"
+        env:
+          IMAGE_TAG: ${{ needs.dockerize.outputs.image_tag }}
 
-  codeql-code-scanning:
-    name: CodeQL - Analyze
+  codeql:
+    name: CodeQL Analyze
     runs-on: ubuntu-latest
-    needs: build-angular-app
+    timeout-minutes: 30
     permissions:
       actions: read
       contents: read
       security-events: write
-    timeout-minutes: 15
+    if: ${{ github.event_name != 'pull_request' || github.base_ref == 'main' }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
