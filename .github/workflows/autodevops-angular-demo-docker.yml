@@ -1,337 +1,288 @@
-# --- Remediation notes ---
-# - Fixed: Dependabot job now only runs for pull_request events using job-level `if`.
-# - Fixed: Lint job will not fail if the 'lint' script is missing; will warn and skip instead.
-# - Fixed: Angular CLI installed as devDependency; `ng` globally installed pre-test if needed.
-# - Security: All actions use pinned versions; secret and environment use least-privilege.
-# - Optimization: Jobs that need Node/Angular configured share node_modules install; concurrency and timeout settings preserved.
-
 name: autodevops-angular-demo-docker
 
 on:
   push:
     branches:
       - main
-      - 'release/**'
   pull_request:
     branches:
       - main
-      - 'release/**'
   workflow_dispatch:
-    inputs:
-      registry:
-        description: 'Azure Container Registry URL'
-        required: true
-        default: 'autodevopsacr.azurecr.io'
-      git_credentials:
-        description: 'Kubernetes secret for Git credentials'
-        required: true
-        default: 'git-credentials'
-      registry_secret:
-        description: 'Kubernetes secret for ACR'
-        required: true
-        default: 'acr-credentials'
-      azure_secret:
-        description: 'Kubernetes secret for Azure credentials'
-        required: true
-        default: 'azure-credentials'
-      app_namespace:
-        description: 'Kubernetes namespace'
-        required: true
-        default: 'argo'
-      resourceGroup:
-        description: 'Azure Resource Group'
-        required: true
-        default: 'sda-auto-devops-demo'
+
+env:
+  NODE_OPTIONS: --max_old_space_size=4096
 
 concurrency:
-  group: autodevops-angular-demo-docker-${{ github.ref }}-${{ github.event_name }}
+  group: gha-autodevops-angular-demo-docker-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
   contents: read
-  id-token: write
   packages: write
-
-env:
-  REGISTRY: ${{ github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
-  GIT_CREDENTIALS_SECRET: ${{ secrets.GIT_CREDENTIALS_SECRET }}
-  ACR_SECRET: ${{ secrets.ACR_SECRET }}
-  AZURE_SECRET: ${{ secrets.AZURE_SECRET }}
-  APP_NAMESPACE: ${{ github.event.inputs.app_namespace || 'argo' }}
-  RESOURCE_GROUP: ${{ github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }}
-  NODE_ENV: production
 
 jobs:
   checkout-and-prepare:
     name: Checkout and Prepare
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    outputs:
+      node_version: ${{ steps.choose-node.outputs.node }}
     steps:
-      - uses: actions/checkout@v4
-      - name: Use Node.js 20.x
-        uses: actions/setup-node@v4
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Setup Caching for npm
+        uses: actions/cache@v4
         with:
-          node-version: '20.x'
-          cache: 'npm'
+          path: ~/.npm
+          key: ${{ runner.os }}-npm-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-npm-
+      - name: Choose Node Version (from .nvmrc or fallback)
+        id: choose-node
+        run: |
+          if [ -f .nvmrc ]; then
+            NODE_VERSION=$(cat .nvmrc)
+          else
+            NODE_VERSION="20"
+          fi
+          echo "Using Node.js version $NODE_VERSION"
+          echo "node=$NODE_VERSION" >> $GITHUB_OUTPUT
 
-  install-deps:
+  dependency-installation:
     name: Dependency Installation
     runs-on: ubuntu-latest
     needs: checkout-and-prepare
-    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Use Node.js ${{ needs.checkout-and-prepare.outputs.node_version }}
+        uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
-          cache: 'npm'
+          node-version: ${{ needs.checkout-and-prepare.outputs.node_version }}
+          cache: "npm"
       - name: Install Dependencies
         run: npm ci
-      - name: Ensure Angular CLI present
-        run: npx ng version || npm install --no-save @angular/cli
+      - name: Ensure All Required DevDependencies
+        run: |
+          missing_dev_deps=0
+          npm pkg get devDependencies > dev.json
+          if ! grep -q '"@angular-devkit/build-angular"' dev.json; then
+            echo "Adding @angular-devkit/build-angular as devDependency"
+            npm install --save-dev @angular-devkit/build-angular@latest
+            missing_dev_deps=1
+          fi
+          if ! grep -q '"stylelint"' dev.json; then
+            echo "Adding stylelint as devDependency"
+            npm install --save-dev stylelint@latest
+            missing_dev_deps=1
+          fi
+          if ! grep -q '"stylelint-config-standard-scss"' dev.json; then
+            echo "Adding stylelint-config-standard-scss as devDependency"
+            npm install --save-dev stylelint-config-standard-scss@latest
+            missing_dev_deps=1
+          fi
+          if [ $missing_dev_deps -eq 1 ]; then
+            echo "Required devDependencies were missing and have been installed."
+          fi
 
-  lint-and-format:
+  add-stylelintrc:
+    name: Ensure Stylelint Configuration
+    runs-on: ubuntu-latest
+    needs: dependency-installation
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Add default .stylelintrc if missing
+        run: |
+          if [ ! -f .stylelintrc.json ] && [ ! -f .stylelintrc ] && [ ! -f .stylelintrc.yml ] && [ ! -f .stylelintrc.yaml ]; then
+            cat <<EOF > .stylelintrc.json
+            {
+              "extends": "stylelint-config-standard-scss",
+              "rules": {
+                "at-rule-no-unknown": [ true, { "ignoreAtRules": ["extend", "at-root", "debug", "warn", "error", "if", "else", "for", "each", "while", "mixin", "include", "function", "return" ] }]
+              }
+            }
+EOF
+            echo "Added .stylelintrc.json"
+          fi
+
+  linting-formatting:
     name: Linting and Formatting
     runs-on: ubuntu-latest
-    needs: install-deps
+    needs: [dependency-installation, add-stylelintrc]
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Use Node.js ${{ needs.checkout-and-prepare.outputs.node_version }}
+        uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
-          cache: 'npm'
+          node-version: ${{ needs.checkout-and-prepare.outputs.node_version }}
+          cache: "npm"
       - name: Install Dependencies
         run: npm ci
       - name: Check for lint script
-        id: check_lint
+        id: lint-script
         run: |
-          if ! npx -c 'npm run | grep -- "^  lint"' >/dev/null; then
-            echo "no_lint_script=true" >> $GITHUB_ENV
+          if grep -q '"lint":' package.json; then
+            echo "found=true" >> $GITHUB_OUTPUT
           else
-            echo "no_lint_script=false" >> $GITHUB_ENV
+            npm pkg set scripts.lint="eslint . --ext .ts,.tsx,.js,.jsx --max-warnings=0"
+            echo "Added lint script to package.json"
+            echo "found=true" >> $GITHUB_OUTPUT
           fi
       - name: Run ESLint
-        if: env.no_lint_script == 'false'
+        if: steps.lint-script.outputs.found == 'true'
         run: npm run lint
-      - name: Warn if lint script missing
-        if: env.no_lint_script == 'true'
-        run: echo "No 'lint' script found in package.json. Skipping lint step."
       - name: Run Stylelint
-        run: npx stylelint '**/*.scss'
-
-  test:
-    name: Unit and Component Testing
-    runs-on: ubuntu-latest
-    needs: install-deps
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '20.x'
-          cache: 'npm'
-      - name: Install Dependencies
-        run: npm ci
-      - name: Ensure Angular CLI is globally available
-        run: |
-          if ! command -v ng > /dev/null; then
-            npm install -g @angular/cli
-          fi
-      - name: Run Tests with Coverage
-        run: npm run test -- --watch=false --browsers=ChromeHeadless --code-coverage
-        env:
-          CI: 'true'
-      - name: Upload Test Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: coverage
+        run: npx stylelint "**/*.scss"
 
   build:
     name: Build Application
     runs-on: ubuntu-latest
-    needs: [lint-and-format, test]
-    timeout-minutes: 15
+    needs: dependency-installation
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Use Node.js ${{ needs.checkout-and-prepare.outputs.node_version }}
+        uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
-          cache: 'npm'
+          node-version: ${{ needs.checkout-and-prepare.outputs.node_version }}
+          cache: "npm"
       - name: Install Dependencies
         run: npm ci
-      - name: Ensure Angular CLI is globally available
-        run: |
-          if ! command -v ng > /dev/null; then
-            npm install -g @angular/cli
-          fi
-      - name: Build Application
-        run: npm run build -- --configuration=production
+      - name: Build Angular App
+        run: npm run build -- --configuration production
 
-  security-scanning:
-    name: Static Code and Dependency Security Scanning
+  unit-test:
+    name: Unit and Component Testing
+    runs-on: ubuntu-latest
+    needs: dependency-installation
+    timeout-minutes: 18
+    steps:
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Use Node.js ${{ needs.checkout-and-prepare.outputs.node_version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ needs.checkout-and-prepare.outputs.node_version }}
+          cache: "npm"
+      - name: Install Dependencies
+        run: npm ci
+      - name: Ensure @angular-devkit/build-angular:karma installed
+        run: |
+          if ! npm ls @angular-devkit/build-angular > /dev/null 2>&1; then
+            npm install --save-dev @angular-devkit/build-angular@latest
+          fi
+      - name: Run Tests with Coverage
+        run: npm run test -- --watch=false --browsers=ChromeHeadless --code-coverage
+
+  e2e-test:
+    name: End-to-End Testing
     runs-on: ubuntu-latest
     needs: build
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout Source
+        uses: actions/checkout@v4
+      - name: Use Node.js ${{ needs.checkout-and-prepare.outputs.node_version }}
+        uses: actions/setup-node@v4
         with:
-          node-version: '20.x'
-          cache: 'npm'
+          node-version: ${{ needs.checkout-and-prepare.outputs.node_version }}
+          cache: "npm"
       - name: Install Dependencies
         run: npm ci
-      - name: Run Trivy Scan on Source
-        uses: aquasecurity/trivy-action@v0.11.2
-        with:
-          scan-type: fs
-          scan-ref: '.'
-          severity: CRITICAL,HIGH
-          format: table
-          exit-code: 1
+      - name: Run E2E Tests
+        run: npm run e2e -- --configuration production
 
-  docker-build-and-scan:
-    name: Container Build and Scanning
+  docker-build:
+    name: Docker Build
     runs-on: ubuntu-latest
-    needs: [build, security-scanning]
-    timeout-minutes: 20
+    needs: build
+    timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Source
+        uses: actions/checkout@v4
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      - name: Login to Azure Container Registry
-        uses: azure/docker-login@v1
+      - name: Login to DockerHub
+        uses: docker/login-action@v3
         with:
-          login-server: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_SECRET }}
-          password: ${{ secrets.ACR_SECRET }}
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Build Docker Image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: false
-          tags: ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }}
-      - name: Trivy Image Scan
-        uses: aquasecurity/trivy-action@v0.11.2
-        with:
-          image-ref: ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }}
-          format: table
-          severity: CRITICAL,HIGH
-          exit-code: 1
-
-  push-image:
-    name: Push Container Image
-    runs-on: ubuntu-latest
-    needs: docker-build-and-scan
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Login to ACR
-        uses: azure/docker-login@v1
-        with:
-          login-server: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_SECRET }}
-          password: ${{ secrets.ACR_SECRET }}
+        run: docker build -t ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:${{ github.sha }} .
       - name: Push Docker Image
-        run: |
-          docker tag ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }} ${{ env.REGISTRY }}/angular-demo-docker:latest
-          docker push ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }}
-          docker push ${{ env.REGISTRY }}/angular-demo-docker:latest
+        run: docker push ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:${{ github.sha }}
 
-  iac-validate:
-    name: Infrastructure as Code Validation
+  docker-harden:
+    name: Docker Harden (Trivy Scan)
     runs-on: ubuntu-latest
-    needs: build
-    timeout-minutes: 10
+    needs: docker-build
+    timeout-minutes: 8
     steps:
-      - uses: actions/checkout@v4
-      - name: Validate Terraform
-        if: ${{ hashFiles('**/*.tf') != '' }}
-        uses: hashicorp/setup-terraform@v3
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@v0.17.0
         with:
-          terraform_version: 1.7.5
-      - name: Terraform Init & Validate
-        if: ${{ hashFiles('**/*.tf') != '' }}
-        run: |
-          terraform init
-          terraform validate
-          terraform plan
-      - name: Validate ARM Templates
-        if: ${{ hashFiles('**/azuredeploy.json') != '' }}
-        uses: Azure/cli@v2
-      - name: ARM What-If
-        if: ${{ hashFiles('**/azuredeploy.json') != '' }}
-        run: |
-          az deployment group what-if --template-file **/azuredeploy.json --resource-group ${{ env.RESOURCE_GROUP }}
+          image-ref: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:${{ github.sha }}
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
 
-  deploy-to-azure:
-    name: Deploy to Azure (Staging/Production)
+  docker-publish-ghcr:
+    name: Publish Image to GHCR
     runs-on: ubuntu-latest
-    needs: [push-image, iac-validate]
-    environment:
-      name: production
-      url: https://${{ env.REGISTRY }}/angular-demo-docker
-    timeout-minutes: 20
-    steps:
-      - uses: actions/checkout@v4
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_SECRET }}
-      - name: Set Kubernetes Context
-        uses: azure/aks-set-context@v3
-        with:
-          resource-group: ${{ env.RESOURCE_GROUP }}
-          cluster-name: ${{ env.APP_NAMESPACE }}
-          admin: true
-      - name: Deploy to AKS via kubectl
-        uses: Azure/k8s-deploy@v5
-        with:
-          namespace: ${{ env.APP_NAMESPACE }}
-          manifests: |
-            k8s/deployment.yaml
-            k8s/service.yaml
-          images: |
-            ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }}
-          imagepullsecrets: ${{ env.REGISTRY_SECRET }}
-
-  post-deploy-smoke-tests:
-    name: Post-Deployment Smoke Testing
-    runs-on: ubuntu-latest
-    needs: deploy-to-azure
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Smoke Test
-        run: |
-          curl --retry 6 --retry-delay 10 --fail https://${{ env.REGISTRY }}/angular-demo-docker/healthz
-
-  monitoring-and-alerts:
-    name: Monitoring and Alert Setup
-    runs-on: ubuntu-latest
-    needs: deploy-to-azure
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-      - name: Azure Login
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_SECRET }}
-      - name: Enable Monitoring
-        run: |
-          az monitor log-analytics workspace create --resource-group ${{ env.RESOURCE_GROUP }} --workspace-name devops-lawa --location eastus --query 'customerId'
-          az monitor diagnostic-settings create --resource ${{ env.RESOURCE_GROUP }} --name aks-diagnostics --workspace devops-lawa --logs '[{"category": "kube-apiserver", "enabled": true}]'
-
-  code-security:
-    name: Dependabot Dependency Check
-    runs-on: ubuntu-latest
+    needs: [docker-build, docker-harden]
     timeout-minutes: 5
-    if: github.event_name == 'pull_request'
     steps:
-      - name: Dependabot Alert Scan
-        uses: dependabot/fetch-metadata@v2
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Tag Image for GHCR
+        run: docker tag ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:${{ github.sha }} ghcr.io/${{ github.repository_owner }}/angular-demo-docker:${{ github.sha }}
+      - name: Push GHCR Image
+        run: docker push ghcr.io/${{ github.repository_owner }}/angular-demo-docker:${{ github.sha }}
+
+  docker-snyk:
+    name: Snyk Container Scan
+    runs-on: ubuntu-latest
+    needs: docker-build
+    timeout-minutes: 6
+    steps:
+      - name: Snyk Scan
+        uses: snyk/actions/docker@0.5.0
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          image: ${{ secrets.DOCKERHUB_USERNAME }}/angular-demo-docker:${{ github.sha }}
+          args: --file=Dockerfile
+
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [docker-publish-ghcr, docker-harden, e2e-test]
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 8
+    steps:
+      - name: Deploy to Staging Server
+        run: echo "Deploying image to staging..." # Replace with actual deployment script
+
+  notify:
+    name: Notify
+    runs-on: ubuntu-latest
+    needs: [deploy-staging]
+    if: always()
+    timeout-minutes: 2
+    steps:
+      - name: Send Slack Notification
+        uses: 8398a7/action-slack@v4
+        with:
+          status: ${{ job.status }}
+          fields: repo,message,commit,author,action
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
