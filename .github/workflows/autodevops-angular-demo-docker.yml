@@ -4,21 +4,23 @@ on:
   push:
     branches:
       - main
+      - 'release/**'
   pull_request:
     branches:
       - main
+      - 'release/**'
   workflow_dispatch:
     inputs:
       registry:
-        description: 'Docker Registry URL'
+        description: 'Azure Container Registry URL'
         required: true
         default: 'autodevopsacr.azurecr.io'
       git_credentials:
-        description: 'Kubernetes secret name for Git credentials'
+        description: 'Kubernetes secret for Git credentials'
         required: true
         default: 'git-credentials'
       registry_secret:
-        description: 'Kubernetes secret for registry auth'
+        description: 'Kubernetes secret for ACR'
         required: true
         default: 'acr-credentials'
       azure_secret:
@@ -26,7 +28,7 @@ on:
         required: true
         default: 'azure-credentials'
       app_namespace:
-        description: 'Kubernetes namespace for deployment'
+        description: 'Kubernetes namespace'
         required: true
         default: 'argo'
       resourceGroup:
@@ -35,302 +37,269 @@ on:
         default: 'sda-auto-devops-demo'
 
 concurrency:
-  group: autodevops-angular-demo-docker-${{ github.head_ref || github.ref }}
+  group: autodevops-angular-demo-docker-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 permissions:
   contents: read
   id-token: write
-  checks: write
+  packages: write
 
 env:
   REGISTRY: ${{ github.event.inputs.registry || 'autodevopsacr.azurecr.io' }}
-  GIT_CREDENTIALS: ${{ github.event.inputs.git_credentials || 'git-credentials' }}
-  REGISTRY_SECRET: ${{ github.event.inputs.registry_secret || 'acr-credentials' }}
-  AZURE_SECRET: ${{ github.event.inputs.azure_secret || 'azure-credentials' }}
+  GIT_CREDENTIALS_SECRET: ${{ secrets.GIT_CREDENTIALS_SECRET }}
+  ACR_SECRET: ${{ secrets.ACR_SECRET }}
+  AZURE_SECRET: ${{ secrets.AZURE_SECRET }}
   APP_NAMESPACE: ${{ github.event.inputs.app_namespace || 'argo' }}
   RESOURCE_GROUP: ${{ github.event.inputs.resourceGroup || 'sda-auto-devops-demo' }}
-  CI: true
+  NODE_ENV: production
 
 jobs:
-
-  checkout-and-setup:
-    name: Checkout code & setup Node
+  checkout-and-prepare:
+    name: Checkout and Prepare
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    outputs:
-      cache-key: ${{ steps.npm-cache.outputs.cache-hit }}
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
-      - name: Use Node.js 18.x
+      - uses: actions/checkout@v4
+      - name: Use Node.js 20.x
         uses: actions/setup-node@v4
         with:
-          node-version: '18.x'
+          node-version: '20.x'
           cache: 'npm'
-      - name: Cache npm dependencies
-        id: npm-cache
-        uses: actions/cache@v4
+
+  install-deps:
+    name: Dependency Installation
+    runs-on: ubuntu-latest
+    needs: checkout-and-prepare
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node18-npm-${{ hashFiles('**/package-lock.json') }}
-          restore-keys: |
-            ${{ runner.os }}-node18-npm-
-      - name: Install dependencies
+          node-version: '20.x'
+          cache: 'npm'
+      - name: Install Dependencies
         run: npm ci
-      - name: Upload repo for later jobs
-        uses: actions/upload-artifact@v4
-        with:
-          name: source
-          path: .
-          retention-days: 1
 
-  static-analysis:
-    name: Static code analysis
-    needs: checkout-and-setup
+  lint-and-format:
+    name: Linting and Formatting
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    needs: install-deps
+    timeout-minutes: 10
     steps:
-      - name: Download repo
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          name: source
-          path: .
-      - name: Lint
+          node-version: '20.x'
+          cache: 'npm'
+      - name: Install Dependencies
+        run: npm ci
+      - name: Run ESLint
         run: npm run lint
+      - name: Run Stylelint
+        run: npx stylelint '**/*.scss'
 
-  unit-tests:
-    name: Run Unit Tests
-    needs: checkout-and-setup
+  test:
+    name: Unit and Component Testing
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Download repo
-        uses: actions/download-artifact@v4
-        with:
-          name: source
-          path: .
-      - name: Run Jest Unit Tests
-        run: npm test -- --ci --coverage
-
-  build-app:
-    name: Build Application
-    needs:
-      - static-analysis
-      - unit-tests
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Download repo
-        uses: actions/download-artifact@v4
-        with:
-          name: source
-          path: .
-      - name: Build for Production
-        run: npm run build
-
-  integration-tests:
-    name: Integration Tests
-    needs: build-app
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Download repo
-        uses: actions/download-artifact@v4
-        with:
-          name: source
-          path: .
-      - name: Run Integration Tests
-        run: npm run test:integration
-
-  build-docker-image:
-    name: Build Docker Image
-    needs: build-app
-    runs-on: ubuntu-latest
+    needs: install-deps
     timeout-minutes: 20
-    env:
-      IMAGE_TAG: ${{ github.sha }}
     steps:
-      - name: Download repo
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          name: source
-          path: .
-      - name: Log in to Azure Container Registry
-        uses: azure/docker-login@v1
-        with:
-          login-server: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-      - name: Build Docker Image
-        run: |
-          docker build -t $REGISTRY/angular-demo-docker:${IMAGE_TAG} .
-      - name: Save Docker image for scanning
-        run: docker save $REGISTRY/angular-demo-docker:${IMAGE_TAG} | gzip > image.tar.gz
-      - name: Upload image for scanning
+          node-version: '20.x'
+          cache: 'npm'
+      - name: Install Dependencies
+        run: npm ci
+      - name: Run Tests with Coverage
+        run: npm run test -- --watch=false --browsers=ChromeHeadless --code-coverage
+        env:
+          CI: 'true'
+      - name: Upload Test Results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: docker-image
-          path: image.tar.gz
-          retention-days: 1
+          name: test-results
+          path: coverage
 
-  scan-image:
-    name: Scan Docker Image for Vulnerabilities
-    needs: build-docker-image
+  build:
+    name: Build Application
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      IMAGE_TAG: ${{ github.sha }}
-    steps:
-      - name: Download Docker Image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-          path: .
-      - name: Load Docker image
-        run: gunzip -c image.tar.gz | docker load
-      - name: Trivy Scan
-        uses: aquasecurity/trivy-action@v0.14.0
-        with:
-          image-ref: ${{ env.REGISTRY }}/angular-demo-docker:${{ env.IMAGE_TAG }}
-          exit-code: '1'
-          ignore-unfixed: true
-          scan-type: 'image'
-          format: 'table'
-          vulnerability-type: 'os,library'
-        env:
-          TRIVY_TIMEOUT: 10m0s
-      - name: Azure Security Center Compliance Check
-        run: echo "Security Center compliance scanning skipped in CI for demonstration."
-
-  push-image:
-    name: Push Docker Image
-    needs: scan-image
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    env:
-      IMAGE_TAG: ${{ github.sha }}
-    steps:
-      - name: Download repo
-        uses: actions/download-artifact@v4
-        with:
-          name: source
-          path: .
-      - name: Log in to Azure Container Registry
-        uses: azure/docker-login@v1
-        with:
-          login-server: ${{ env.REGISTRY }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-      - name: Push Docker Image
-        run: |
-          docker build -t $REGISTRY/angular-demo-docker:${IMAGE_TAG} .
-          docker push $REGISTRY/angular-demo-docker:${IMAGE_TAG}
-
-  deploy-infra:
-    name: Deploy Azure Infrastructure
-    needs: push-image
-    runs-on: ubuntu-latest
-    timeout-minutes: 25
-    environment:
-      name: 'production'
-    steps:
-      - name: Setup Azure CLI
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - name: Deploy ARM Templates or Terraform
-        run: |
-          echo "Deploying infrastructure as code (ARM/TF) - implement deployment."
-          # Example: az deployment group create --resource-group $RESOURCE_GROUP --template-file infra/main.bicep
-
-  deploy-app:
-    name: Deploy app to AKS/Container Apps
-    needs: deploy-infra
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    environment:
-      name: 'production'
-      url: ''
-    steps:
-      - name: Setup Azure CLI
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-      - name: Set AKS Credentials
-        run: |
-          az aks get-credentials --resource-group $RESOURCE_GROUP --name $APP_NAMESPACE --overwrite-existing
-      - name: Deploy to AKS/Container App
-        run: |
-          echo "kubectl apply -f k8s/deployment.yaml --namespace $APP_NAMESPACE"
-          # Substitute image tag in manifest and apply
-
-  post-deployment-tests:
-    name: Post-Deployment Smoke/Health Tests
-    needs: deploy-app
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Run API Health Check
-        run: |
-          curl --fail http://your.app.url/api/health || exit 1
-      - name: Run Auth Endpoint Check
-        run: |
-          curl -I http://your.app.url/api/auth | grep '401'
-      - name: Run UI Health Check
-        run: |
-          curl --fail http://your.app.url/ || exit 1
-
-  security-and-monitoring:
-    name: Security Scan & Monitoring Setup
-    needs: post-deployment-tests
-    runs-on: ubuntu-latest
+    needs: [lint-and-format, test]
     timeout-minutes: 15
     steps:
-      - name: Azure Security Center Query
-        run: |
-          echo "Querying Azure Security Center for latest posture..."
-      - name: Azure Monitor Setup
-        run: |
-          echo "Setting up Azure Monitor and dashboards..."
-      - name: AKS Policy Enforcement
-        run: |
-          echo "Ensure AKS best practice policies are enforced..."
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+      - name: Install Dependencies
+        run: npm ci
+      - name: Build Application
+        run: npm run build -- --configuration=production
 
-  cleanup:
-    name: Cleanup
+  security-scanning:
+    name: Static Code and Dependency Security Scanning
     runs-on: ubuntu-latest
-    if: always()
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20.x'
+          cache: 'npm'
+      - name: Install Dependencies
+        run: npm ci
+      - name: Run Trivy Scan on Source
+        uses: aquasecurity/trivy-action@v0.11.2
+        with:
+          scan-type: fs
+          scan-ref: '.'
+          severity: CRITICAL,HIGH
+          format: table
+          exit-code: 1
+
+  docker-build-and-scan:
+    name: Container Build and Scanning
+    runs-on: ubuntu-latest
+    needs: [build, security-scanning]
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Login to Azure Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_SECRET }}
+          password: ${{ secrets.ACR_SECRET }}
+      - name: Build Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }}
+      - name: Trivy Image Scan
+        uses: aquasecurity/trivy-action@v0.11.2
+        with:
+          image-ref: ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }}
+          format: table
+          severity: CRITICAL,HIGH
+          exit-code: 1
+
+  push-image:
+    name: Push Container Image
+    runs-on: ubuntu-latest
+    needs: docker-build-and-scan
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Login to ACR
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY }}
+          username: ${{ secrets.ACR_SECRET }}
+          password: ${{ secrets.ACR_SECRET }}
+      - name: Push Docker Image
+        run: |
+          docker tag ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }} ${{ env.REGISTRY }}/angular-demo-docker:latest
+          docker push ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/angular-demo-docker:latest
+
+  iac-validate:
+    name: Infrastructure as Code Validation
+    runs-on: ubuntu-latest
+    needs: build
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Terraform
+        if: ${{ hashFiles('**/*.tf') != '' }}
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.5
+      - name: Terraform Init & Validate
+        if: ${{ hashFiles('**/*.tf') != '' }}
+        run: |
+          terraform init
+          terraform validate
+          terraform plan
+      - name: Validate ARM Templates
+        if: ${{ hashFiles('**/azuredeploy.json') != '' }}
+        uses: Azure/cli@v2
+      - name: ARM What-If
+        if: ${{ hashFiles('**/azuredeploy.json') != '' }}
+        run: |
+          az deployment group what-if --template-file **/azuredeploy.json --resource-group ${{ env.RESOURCE_GROUP }}
+
+  deploy-to-azure:
+    name: Deploy to Azure (Staging/Production)
+    runs-on: ubuntu-latest
+    needs: [push-image, iac-validate]
+    environment:
+      name: production
+      url: https://${{ env.REGISTRY }}/angular-demo-docker
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_SECRET }}
+      - name: Set Kubernetes Context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.APP_NAMESPACE }}
+          admin: true
+      - name: Deploy to AKS via kubectl
+        uses: Azure/k8s-deploy@v5
+        with:
+          namespace: ${{ env.APP_NAMESPACE }}
+          manifests: |
+            k8s/deployment.yaml
+            k8s/service.yaml
+          images: |
+            ${{ env.REGISTRY }}/angular-demo-docker:${{ github.sha }}
+          imagepullsecrets: ${{ env.REGISTRY_SECRET }}
+
+  post-deploy-smoke-tests:
+    name: Post-Deployment Smoke Testing
+    runs-on: ubuntu-latest
+    needs: deploy-to-azure
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Smoke Test
+        run: |
+          curl --retry 6 --retry-delay 10 --fail https://${{ env.REGISTRY }}/angular-demo-docker/healthz
+
+  monitoring-and-alerts:
+    name: Monitoring and Alert Setup
+    runs-on: ubuntu-latest
+    needs: deploy-to-azure
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_SECRET }}
+      - name: Enable Monitoring
+        run: |
+          az monitor log-analytics workspace create --resource-group ${{ env.RESOURCE_GROUP }} --workspace-name devops-lawa --location eastus --query 'customerId'
+          az monitor diagnostic-settings create --resource ${{ env.RESOURCE_GROUP }} --name aks-diagnostics --workspace devops-lawa --logs '[{"category": "kube-apiserver", "enabled": true}]'
+
+  code-security:
+    name: Dependabot Dependency Check
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - name: Remove artifacts after workflow
-        run: |
-          echo "Cleanup complete"
-
-jobs:
-  checkout-and-setup:
-    # Already defined above.
-  static-analysis:
-    # Already defined above.
-  unit-tests:
-    # Already defined above.
-  build-app:
-    # Already defined above.
-  integration-tests:
-    # Already defined above.
-  build-docker-image:
-    # Already defined above.
-  scan-image:
-    # Already defined above.
-  push-image:
-    # Already defined above.
-  deploy-infra:
-    # Already defined above.
-  deploy-app:
-    # Already defined above.
-  post-deployment-tests:
-    # Already defined above.
-  security-and-monitoring:
-    # Already defined above.
-  cleanup:
-    # Already defined above.
+      - name: Dependabot Alert Scan
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
